@@ -1,6 +1,9 @@
-Flask
-flask-cors
-pymongo
-web3
-python-dotenv
-Werkzeug
+Flask>=3.0.0
+flask-cors>=5.0.0
+pymongo>=4.6.0
+web3>=7.0.0
+python-dotenv>=1.0.0
+Werkzeug>=3.0.0
+gunicorn>=22.0.0
+numpy>=1.26.0
+opencv-python-headless>=4.9.0.80
