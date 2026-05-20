@@ -38,6 +38,7 @@ WEB3_RPC_URL = os.getenv("WEB3_RPC_URL", "https://sepolia.drpc.org").strip()
 CONTRACT_ADDRESS = os.getenv("CONTRACT_ADDRESS", "").strip()
 PRIVATE_KEY = os.getenv("PRIVATE_KEY", "").strip()
 BLOCKCHAIN_MODE = os.getenv("BLOCKCHAIN_MODE", "auto").strip().lower()  # auto | real | mock
+APP_VERSION = "2026-05-20-cloud-sync-v4"
 
 client = None
 db = None
@@ -146,6 +147,110 @@ def make_mock_tx_hash(payload: Dict[str, Any]) -> str:
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True) + str(dt.datetime.now(dt.timezone.utc).timestamp())
     return "0x" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
+
+def get_user_aliases(username: str, users=None) -> list[str]:
+    """Return all possible farmer keys used by older and newer frontend versions."""
+    aliases: list[str] = []
+    username = normalize_username(username)
+    if username:
+        aliases.extend([username, username.strip()])
+
+    user = None
+    try:
+        if users is not None and username:
+            user = users.find_one({"username": username})
+    except Exception:
+        user = None
+
+    if user:
+        for key in ("fullname", "username", "farmer_id"):
+            value = clean_str(user.get(key))
+            if value:
+                aliases.extend([value, value.lower()])
+
+    # de-duplicate while preserving order
+    output: list[str] = []
+    seen = set()
+    for item in aliases:
+        if item and item not in seen:
+            output.append(item)
+            seen.add(item)
+    return output
+
+
+def build_farmer_query(username: str, users=None) -> Dict[str, Any]:
+    aliases = get_user_aliases(username, users)
+    if not aliases:
+        return {}
+    return {
+        "$or": [
+            {"farmer": {"$in": aliases}},
+            {"farmer_display": {"$in": aliases}},
+            {"username": {"$in": aliases}},
+        ]
+    }
+
+
+def object_id_iso(record: Dict[str, Any]) -> str:
+    oid = record.get("_id")
+    try:
+        return oid.generation_time.isoformat()
+    except Exception:
+        return ""
+
+
+def normalize_harvest_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Make legacy blockchain-only records and new cloud records render the same way."""
+    record = dict(record)
+    oid = record.get("_id")
+    record["_id"] = str(oid)
+
+    flower_type = clean_str(record.get("flower_type"))
+    flower_name = clean_str(record.get("flower_name"))
+    quality = clean_str(record.get("quality"))
+
+    if flower_type and not flower_name:
+        flower_name = flower_type.split(" - ")[0].split("|")[1] if "|" in flower_type and len(flower_type.split("|")) > 1 else flower_type.split(" - ")[0]
+    if not flower_name:
+        flower_name = "Cúc Đại Đóa"
+
+    if not quality:
+        if "Loại 1" in flower_type:
+            quality = "Loại 1"
+        elif "Loại 2" in flower_type:
+            quality = "Loại 2"
+        elif "Loại 3" in flower_type:
+            quality = "Loại 3"
+        else:
+            quality = "Loại 3"
+
+    if not flower_type:
+        flower_type = f"{flower_name} - {quality}"
+
+    record.setdefault("ma_lo", "LOT_" + str(record["_id"])[-6:].upper())
+    record.setdefault("flower_name", flower_name)
+    record.setdefault("quality", quality)
+    record.setdefault("flower_type", flower_type)
+    record.setdefault("ten_vuon", "Vườn cục bộ")
+    record.setdefault("ngay_thu", "")
+    record.setdefault("khu_vuc", "Chưa xác định")
+    record.setdefault("gia_ban", "")
+    record.setdefault("ghi_chu", "")
+    record.setdefault("tx_hash", "")
+    record.setdefault("blockchain_status", "confirmed" if record.get("tx_hash") else "old")
+    record.setdefault("blockchain_mode", "real")
+    record.setdefault("block_number", None)
+    record.setdefault("recorded_at", object_id_iso(record))
+    record.setdefault("date", vn_time_display(record.get("_created_at")) if False else (record.get("date") or record.get("recorded_at") or "Hệ thống cũ"))
+    record.setdefault("schema_version", "legacy-normalized")
+    return record
+
+
+def harvest_sort_key(record: Dict[str, Any]) -> str:
+    value = clean_str(record.get("recorded_at"))
+    if value:
+        return value
+    return object_id_iso(record)
 
 
 def send_to_blockchain(farmer: str, combined_flower_type: str, weight: int) -> Tuple[str, str, str, Any, str]:
@@ -404,7 +509,10 @@ def file_too_large(_):
 def health():
     return json_ok(
         {
+            "app_version": APP_VERSION,
             "database": harvest_collection is not None and users_collection is not None,
+            "db_name": DB_NAME,
+            "collection": "harvest_records",
             "web3_connected": bool(w3 and w3.is_connected()),
             "blockchain_mode": BLOCKCHAIN_MODE,
             "blockchain_ready": blockchain_is_configured(),
@@ -510,7 +618,7 @@ def login():
 def add_harvest():
     inserted_id = None
     try:
-        harvests, _ = require_db()
+        harvests, users = require_db()
         data = get_json_body()
         farmer = normalize_username(data.get("farmer"))
         ma_lo = clean_str(data.get("ma_lo"))
@@ -526,6 +634,14 @@ def add_harvest():
         ai_price = clean_str(data.get("ai_price"))
         ai_perimeter = data.get("ai_perimeter")
 
+        user_doc = users.find_one({"username": farmer}) if farmer else None
+        farmer_display = (
+            clean_str(data.get("farmer_display"))
+            or clean_str(data.get("farmer_name"))
+            or clean_str(user_doc.get("fullname") if user_doc else "")
+            or farmer
+        )
+
         required = [farmer, ma_lo, flower_name, ten_vuon, ngay_thu, khu_vuc, gia_ban, quality]
         if not all(required):
             return json_error("Vui lòng điền đầy đủ thông tin bắt buộc.", 400)
@@ -536,6 +652,7 @@ def add_harvest():
         # Lưu cloud trước để không mất phiếu nếu Blockchain/RPC bị treo.
         doc = {
             "farmer": farmer,
+            "farmer_display": farmer_display,
             "ma_lo": ma_lo,
             "flower_name": flower_name,
             "ten_vuon": ten_vuon,
@@ -556,6 +673,7 @@ def add_harvest():
             "ai_type": ai_type,
             "ai_price": ai_price,
             "ai_perimeter": ai_perimeter,
+            "schema_version": APP_VERSION,
         }
         insert_result = harvests.insert_one(doc)
         inserted_id = insert_result.inserted_id
@@ -575,6 +693,7 @@ def add_harvest():
             harvests.update_one({"_id": inserted_id}, {"$set": update_fields})
             doc.update(update_fields)
             doc["_id"] = str(inserted_id)
+            doc = normalize_harvest_record(doc)
             return jsonify({
                 "status": "error",
                 "cloud_saved": True,
@@ -592,6 +711,7 @@ def add_harvest():
         harvests.update_one({"_id": inserted_id}, {"$set": update_fields})
         doc.update(update_fields)
         doc["_id"] = str(inserted_id)
+        doc = normalize_harvest_record(doc)
 
         if tx_status == "failed":
             return jsonify({
@@ -621,14 +741,24 @@ def add_harvest():
 @app.route("/api/history", methods=["GET"])
 def get_history():
     try:
-        harvests, _ = require_db()
+        harvests, users = require_db()
         farmer = normalize_username(request.args.get("farmer"))
         if not farmer:
             return json_error("Thiếu farmer.", 400)
-        records = list(harvests.find({"farmer": farmer}).sort([("recorded_at", DESCENDING), ("_id", DESCENDING)]))
-        for record in records:
-            record["_id"] = str(record["_id"])
-        return json_ok({"records": records})
+
+        query = build_farmer_query(farmer, users)
+        records = [normalize_harvest_record(r) for r in harvests.find(query)]
+        records.sort(key=harvest_sort_key, reverse=True)
+
+        return json_ok({
+            "app_version": APP_VERSION,
+            "db_name": DB_NAME,
+            "collection": "harvest_records",
+            "farmer": farmer,
+            "aliases": get_user_aliases(farmer, users),
+            "count": len(records),
+            "records": records,
+        })
     except Exception as exc:
         return json_error(str(exc), 500)
 
@@ -636,18 +766,70 @@ def get_history():
 @app.route("/api/stats", methods=["GET"])
 def get_stats():
     try:
-        harvests, _ = require_db()
+        harvests, users = require_db()
         farmer = normalize_username(request.args.get("farmer"))
         if not farmer:
             return json_error("Thiếu farmer.", 400)
-        user_records = list(harvests.find({"farmer": farmer}))
+
+        query = build_farmer_query(farmer, users)
+        user_records = [normalize_harvest_record(r) for r in harvests.find(query)]
         total_weight = sum(int(record.get("weight", 0) or 0) for record in user_records)
         loai1_weight = sum(
             int(record.get("weight", 0) or 0)
             for record in user_records
             if record.get("quality") == "Loại 1" or "Loại 1" in record.get("flower_type", "")
         )
-        return json_ok({"total_weight": total_weight, "loai1_weight": loai1_weight})
+        return json_ok({
+            "app_version": APP_VERSION,
+            "farmer": farmer,
+            "aliases": get_user_aliases(farmer, users),
+            "record_count": len(user_records),
+            "total_weight": total_weight,
+            "loai1_weight": loai1_weight,
+        })
+    except Exception as exc:
+        return json_error(str(exc), 500)
+
+
+@app.route("/api/debug/latest", methods=["GET"])
+def debug_latest_records():
+    """Small diagnostic endpoint for demo/debugging MongoDB sync issues."""
+    try:
+        harvests, users = require_db()
+        farmer = normalize_username(request.args.get("farmer"))
+        limit = min(parse_positive_int(request.args.get("limit", 10), "limit"), 50)
+        query = build_farmer_query(farmer, users) if farmer else {}
+        records = [normalize_harvest_record(r) for r in harvests.find(query)]
+        records.sort(key=harvest_sort_key, reverse=True)
+        return json_ok({
+            "app_version": APP_VERSION,
+            "db_name": DB_NAME,
+            "collection": "harvest_records",
+            "farmer": farmer,
+            "aliases": get_user_aliases(farmer, users) if farmer else [],
+            "total_matching_records": len(records),
+            "records": records[:limit],
+        })
+    except Exception as exc:
+        return json_error(str(exc), 500)
+
+
+@app.route("/api/debug/find", methods=["GET"])
+def debug_find_record():
+    try:
+        harvests, _ = require_db()
+        ma_lo = clean_str(request.args.get("ma_lo"))
+        tx_hash = clean_str(request.args.get("tx_hash"))
+        if not ma_lo and not tx_hash:
+            return json_error("Truyền ma_lo hoặc tx_hash để kiểm tra.", 400)
+        query = {"$or": []}
+        if ma_lo:
+            query["$or"].append({"ma_lo": ma_lo})
+        if tx_hash:
+            query["$or"].append({"tx_hash": tx_hash})
+        records = [normalize_harvest_record(r) for r in harvests.find(query)]
+        records.sort(key=harvest_sort_key, reverse=True)
+        return json_ok({"count": len(records), "records": records})
     except Exception as exc:
         return json_error(str(exc), 500)
 
