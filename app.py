@@ -337,7 +337,7 @@ def classify_flower_image(image_bytes: bytes) -> Dict[str, Any]:
     if frame is None:
         raise ValueError("Không đọc được ảnh. Vui lòng gửi ảnh JPG/PNG hợp lệ.")
 
-    # 1. ÉP KÍCH THƯỚC CHUẨN NHƯ APP2.PY ĐỂ ĐO CHU VI KHÔNG BỊ LỆCH
+    # 1. ÉP KÍCH THƯỚC CHUẨN NHƯ APP2.PY ĐỂ ĐO CHU VI KHÔNG BỊ SAI LỆCH
     frame = cv2.resize(frame, (640, 720))
     result = frame.copy()
     h, w = frame.shape[:2]
@@ -347,12 +347,12 @@ def classify_flower_image(image_bytes: bytes) -> Dict[str, Any]:
     roi_x2 = int(w * 0.80)
     roi_y1 = int(h * 0.15)
     roi_y2 = int(h * 0.85)
-
     roi = frame[roi_y1:roi_y2, roi_x1:roi_x2]
     
     cv2.rectangle(result, (roi_x1, roi_y1), (roi_x2, roi_y2), (255, 255, 255), 2)
 
-    # 3. CHỈ LỌC DUY NHẤT MÀU VÀNG CỦA CÚC (BỎ QUA NỀN TRẮNG IPAD)
+    # 3. CHỈ LỌC DUY NHẤT MÀU VÀNG CỦA HOA CÚC CHUẨN XÁC NHƯ APP2.PY
+    # (Việc bỏ qua dải trắng/cam và bỏ Fallback sẽ giúp loại trừ da người và viền màn hình)
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     lower_yellow = np.array([15, 60, 60])
     upper_yellow = np.array([40, 255, 255])
@@ -374,16 +374,16 @@ def classify_flower_image(image_bytes: bytes) -> Dict[str, Any]:
         largest = max(contours, key=cv2.contourArea)
         area = float(cv2.contourArea(largest))
         
-        # Chỉ lấy nếu diện tích đủ lớn để tránh bắt nhầm đóm vàng nhỏ
-        if area > 1000:
+        # Chỉ xét nếu diện tích màu vàng đủ lớn, bỏ qua các đốm nhiễu li ti
+        if area > 800:
             detected = True
-            contour_shifted = largest + np.array([[[roi_x1, roi_y1]]])
-            
-            # Vẽ viền xanh lá bọc quanh bông hoa
-            cv2.drawContours(result, [contour_shifted], -1, (0, 255, 0), 4)
             perimeter = float(cv2.arcLength(largest, True))
+            
+            # Bo viền xanh lá cây ôm sát mép vùng hoa vàng
+            contour_shifted = largest + np.array([[[roi_x1, roi_y1]]])
+            cv2.drawContours(result, [contour_shifted], -1, (0, 255, 0), 4)
 
-    # 6. CHẤM ĐIỂM (CLASSIFICATION RULES TỪ APP2.PY)
+    # 6. CHẤM ĐIỂM DỰA TRÊN NGƯỠNG CHU VI NHƯ APP2.PY
     if detected and perimeter > 800:
         flower_type = "TYPE 1 - LARGE"
         quality = "Loại 1"
@@ -406,12 +406,11 @@ def classify_flower_image(image_bytes: bytes) -> Dict[str, Any]:
         price_vnd = 0
         color = (255, 255, 255)
 
-    # VẼ INFO LÊN ẢNH
-    cv2.putText(result, flower_type, (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.95, color, 3)
-    cv2.putText(result, f"{price_vnd:,} VND", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.85, color, 2)
-    cv2.putText(result, f"Perimeter: {int(perimeter)}", (20, 132), cv2.FONT_HERSHEY_SIMPLEX, 0.62, color, 2)
+    # IN KẾT QUẢ LÊN ẢNH
+    cv2.putText(result, flower_type, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 3)
+    cv2.putText(result, f"{price_vnd:,} VND", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 3)
+    cv2.putText(result, f"Perimeter: {int(perimeter)}", (20, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
-    # Đóng gói ảnh gửi về Frontend
     ok, buffer = cv2.imencode(".jpg", result, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
     annotated_image = "data:image/jpeg;base64," + base64.b64encode(buffer).decode("utf-8") if ok else ""
 
