@@ -330,158 +330,88 @@ def classify_flower_image(image_bytes: bytes) -> Dict[str, Any]:
         import cv2
         import numpy as np
     except Exception as exc:
-        raise RuntimeError("Thiếu thư viện AI trên backend. Cập nhật requirements.txt, deploy lại backend, rồi kiểm tra log Render. Cần có: opencv-python-headless và numpy. Chi tiết: " + str(exc))
+        raise RuntimeError("Thiếu thư viện AI trên backend...")
 
-    """Detect and classify a chrysanthemum bundle from an uploaded image.
-
-    The first integrated version was too strict: it only accepted a narrow yellow
-    HSV range inside a small center ROI and required perimeter > 550. In real
-    camera/upload images, the flower may be off-center, too small, white/pink,
-    or affected by lighting. This version keeps the same HSV/contour idea but
-    makes it robust enough for demo use.
-    """
     np_arr = np.frombuffer(image_bytes, np.uint8)
     frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
     if frame is None:
         raise ValueError("Không đọc được ảnh. Vui lòng gửi ảnh JPG/PNG hợp lệ.")
 
-    # Keep aspect ratio instead of forcing 640x720, because forced stretching can
-    # change contour perimeter and make classification unstable.
-    h0, w0 = frame.shape[:2]
-    max_side = 900
-    scale = min(max_side / max(h0, w0), 1.0)
-    if scale < 1.0:
-        frame = cv2.resize(frame, (int(w0 * scale), int(h0 * scale)), interpolation=cv2.INTER_AREA)
-
+    # 1. ÉP CỨNG VỀ SIZE CỦA STREAMLIT ĐỂ GIỮ CHUẨN ĐO LƯỜNG CHU VI
+    frame = cv2.resize(frame, (640, 720))
     result = frame.copy()
     h, w = frame.shape[:2]
 
-    # Wider ROI: many phone photos do not place the flower perfectly in center.
-    roi_x1, roi_x2 = int(w * 0.05), int(w * 0.95)
-    roi_y1, roi_y2 = int(h * 0.05), int(h * 0.95)
+    # 2. SỬ DỤNG LẠI ROI HẸP TỪ APP2.PY (20% - 80% width)
+    roi_x1, roi_x2 = int(w * 0.20), int(w * 0.80)
+    roi_y1, roi_y2 = int(h * 0.15), int(h * 0.85)
     roi = frame[roi_y1:roi_y2, roi_x1:roi_x2]
-    roi_h, roi_w = roi.shape[:2]
-    roi_area_total = max(roi_h * roi_w, 1)
-
+    
     cv2.rectangle(result, (roi_x1, roi_y1), (roi_x2, roi_y2), (255, 255, 255), 2)
 
-    # Light smoothing reduces tiny mask noise but keeps the overall flower shape.
-    blur = cv2.GaussianBlur(roi, (5, 5), 0)
-    hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
-
-    # Multiple color masks. Chrysanthemums in the demo may be yellow, white,
-    # orange, pink, or red/purple under different lighting.
+    # 3. KẾT HỢP KHỬ NHIỄU NHIỀU MÀU TỪ APP.PY VÀ MORPHOLOGY TỪ APP2.PY
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    
     yellow = cv2.inRange(hsv, np.array([10, 35, 55]), np.array([48, 255, 255]))
-    orange = cv2.inRange(hsv, np.array([5, 45, 55]), np.array([25, 255, 255]))
     white = cv2.inRange(hsv, np.array([0, 0, 145]), np.array([179, 95, 255]))
-    pink_purple = cv2.inRange(hsv, np.array([125, 30, 55]), np.array([179, 255, 255]))
-    red_low = cv2.inRange(hsv, np.array([0, 40, 55]), np.array([8, 255, 255]))
-
-    color_mask = yellow | orange | white | pink_purple | red_low
-
-    # Remove most green leaves/grass/background from the candidate mask.
+    color_mask = yellow | white # Giữ lại các màu cốt lõi
+    
     green = cv2.inRange(hsv, np.array([45, 35, 35]), np.array([95, 255, 255]))
     color_mask = cv2.bitwise_and(color_mask, cv2.bitwise_not(green))
 
-    kernel_small = np.ones((5, 5), np.uint8)
-    kernel_big = np.ones((11, 11), np.uint8)
-    mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, kernel_small, iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_big, iterations=2)
-    mask = cv2.dilate(mask, kernel_small, iterations=1)
+    # Kernel 9x9 giống hệt app2.py
+    kernel = np.ones((9, 9), np.uint8)
+    mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.dilate(mask, kernel, iterations=2)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    # Filter and score candidates. White backgrounds can create huge border-touching
-    # contours, so those receive a penalty.
-    min_area = roi_area_total * 0.003
-    candidates = []
-    for contour in contours:
-        area = float(cv2.contourArea(contour))
-        if area < min_area:
-            continue
-        x, y, bw, bh = cv2.boundingRect(contour)
-        touches_border = x <= 2 or y <= 2 or (x + bw) >= roi_w - 2 or (y + bh) >= roi_h - 2
-        area_ratio_tmp = area / roi_area_total
-        score = area
-        if touches_border and area_ratio_tmp > 0.40:
-            score *= 0.20
-        elif touches_border:
-            score *= 0.65
-        candidates.append((score, contour, area, (x, y, bw, bh)))
-
-    # Fallback: if color mask is weak, use saturation/brightness objectness inside ROI.
-    if not candidates:
-        sat = hsv[:, :, 1]
-        val = hsv[:, :, 2]
-        object_mask = cv2.inRange(sat, 35, 255) & cv2.inRange(val, 55, 255)
-        object_mask = cv2.bitwise_and(object_mask, cv2.bitwise_not(green))
-        object_mask = cv2.morphologyEx(object_mask, cv2.MORPH_CLOSE, kernel_big, iterations=2)
-        object_mask = cv2.dilate(object_mask, kernel_small, iterations=1)
-        contours, _ = cv2.findContours(object_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for contour in contours:
-            area = float(cv2.contourArea(contour))
-            if area < min_area:
-                continue
-            x, y, bw, bh = cv2.boundingRect(contour)
-            touches_border = x <= 2 or y <= 2 or (x + bw) >= roi_w - 2 or (y + bh) >= roi_h - 2
-            score = area * (0.65 if touches_border else 1.0)
-            candidates.append((score, contour, area, (x, y, bw, bh)))
-
     perimeter = 0.0
     area = 0.0
-    bbox = None
     detected = False
-    if candidates:
-        _, largest, area, bbox = max(candidates, key=lambda item: item[0])
-        perimeter = float(cv2.arcLength(largest, True))
-        area_ratio = area / roi_area_total
-        detected = area_ratio >= 0.010 and perimeter >= 120
-        contour_shifted = largest + np.array([[[roi_x1, roi_y1]]])
-        cv2.drawContours(result, [contour_shifted], -1, (0, 255, 0) if detected else (0, 255, 255), 4)
-        if bbox:
-            x, y, bw, bh = bbox
-            cv2.rectangle(result, (roi_x1 + x, roi_y1 + y), (roi_x1 + x + bw, roi_y1 + y + bh), (255, 180, 0), 2)
-    else:
-        area_ratio = 0.0
 
-    mask_pixels = int(cv2.countNonZero(mask))
-    mask_ratio = mask_pixels / roi_area_total
+    if contours:
+        # Lấy contour lớn nhất như app2.py
+        largest = max(contours, key=cv2.contourArea)
+        area = float(cv2.contourArea(largest))
+        
+        # Chỉ xét nếu diện tích đủ lớn để loại bỏ nhiễu nhỏ
+        if area > 1000: 
+            detected = True
+            perimeter = float(cv2.arcLength(largest, True))
+            
+            contour_shifted = largest + np.array([[[roi_x1, roi_y1]]])
+            cv2.drawContours(result, [contour_shifted], -1, (0, 255, 0), 4)
 
-    # Classification uses relative size first, then perimeter as a fallback.
-    # This is more stable across phone/laptop camera resolutions.
-    if detected and (area_ratio >= 0.120 or perimeter >= 900):
+    # 4. CHUẨN HÓA LOGIC PHÂN LOẠI 100% THEO APP2.PY
+    if detected and perimeter > 800:
         flower_type = "TYPE 1 - LARGE"
         quality = "Loại 1"
         price_vnd = 500000
         color = (0, 255, 0)
-    elif detected and (area_ratio >= 0.060 or perimeter >= 620):
+    elif detected and perimeter > 700:
         flower_type = "TYPE 2 - MEDIUM"
         quality = "Loại 2"
         price_vnd = 400000
         color = (0, 255, 255)
-    elif detected:
+    elif detected and perimeter > 550:
         flower_type = "TYPE 3 - SMALL"
         quality = "Loại 3"
         price_vnd = 300000
         color = (0, 0, 255)
     else:
+        detected = False # Ép về false nếu chu vi quá nhỏ
         flower_type = "UNDETECTED"
         quality = "Không xác định"
         price_vnd = 0
         color = (255, 255, 255)
 
-    confidence = 0.0
-    if detected:
-        confidence = min(0.99, max(0.35, area_ratio * 4.2 + min(perimeter / 2200.0, 0.35)))
-
     cv2.putText(result, flower_type, (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.95, color, 3)
     cv2.putText(result, f"{price_vnd:,} VND", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.85, color, 2)
-    cv2.putText(result, f"Perimeter: {int(perimeter)} | Area: {area_ratio * 100:.1f}%", (20, 132), cv2.FONT_HERSHEY_SIMPLEX, 0.62, color, 2)
+    cv2.putText(result, f"Perimeter: {int(perimeter)}", (20, 132), cv2.FONT_HERSHEY_SIMPLEX, 0.62, color, 2)
 
     ok, buffer = cv2.imencode(".jpg", result, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
-    annotated_image = ""
-    if ok:
-        annotated_image = "data:image/jpeg;base64," + base64.b64encode(buffer).decode("utf-8")
+    annotated_image = "data:image/jpeg;base64," + base64.b64encode(buffer).decode("utf-8") if ok else ""
 
     return {
         "detected": bool(detected),
@@ -492,10 +422,6 @@ def classify_flower_image(image_bytes: bytes) -> Dict[str, Any]:
         "price_display": f"{price_vnd:,}".replace(",", ".") + " VNĐ" if price_vnd else "0 VNĐ",
         "perimeter": round(perimeter, 2),
         "area": round(area, 2),
-        "area_ratio": round(area_ratio, 4),
-        "mask_ratio": round(mask_ratio, 4),
-        "confidence": round(confidence, 3),
-        "roi": {"x1": roi_x1, "x2": roi_x2, "y1": roi_y1, "y2": roi_y2},
         "annotated_image": annotated_image,
     }
 
