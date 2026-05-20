@@ -383,18 +383,18 @@ def classify_flower_image(image_bytes: bytes) -> Dict[str, Any]:
             contour_shifted = largest + np.array([[[roi_x1, roi_y1]]])
             cv2.drawContours(result, [contour_shifted], -1, (0, 255, 0), 4)
 
-    # 6. CHẤM ĐIỂM DỰA TRÊN NGƯỠNG CHU VI NHƯ APP2.PY
-    if detected and perimeter > 800:
+# 6. PHÂN LOẠI DỰA TRÊN QUY ƯỚC MỚI CỦA BẠN
+    if detected and perimeter >= 1250:
         flower_type = "TYPE 1 - LARGE"
         quality = "Loại 1"
         price_vnd = 500000
         color = (0, 255, 0)
-    elif detected and perimeter > 700:
+    elif detected and perimeter >= 900:
         flower_type = "TYPE 2 - MEDIUM"
         quality = "Loại 2"
         price_vnd = 400000
         color = (0, 255, 255)
-    elif detected and perimeter > 550:
+    elif detected and perimeter >= 700:
         flower_type = "TYPE 3 - SMALL"
         quality = "Loại 3"
         price_vnd = 300000
@@ -410,7 +410,6 @@ def classify_flower_image(image_bytes: bytes) -> Dict[str, Any]:
     cv2.putText(result, flower_type, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 3)
     cv2.putText(result, f"{price_vnd:,} VND", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 3)
     cv2.putText(result, f"Perimeter: {int(perimeter)}", (20, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-
     ok, buffer = cv2.imencode(".jpg", result, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
     annotated_image = "data:image/jpeg;base64," + base64.b64encode(buffer).decode("utf-8") if ok else ""
 
