@@ -337,43 +337,30 @@ def classify_flower_image(image_bytes: bytes) -> Dict[str, Any]:
     if frame is None:
         raise ValueError("Không đọc được ảnh. Vui lòng gửi ảnh JPG/PNG hợp lệ.")
 
-    # 1. BẢO TOÀN TỶ LỆ ẢNH ĐỂ ĐO CHU VI KHÔNG BỊ MÉO DẠNG
-    h0, w0 = frame.shape[:2]
-    scale = 640.0 / w0
-    frame = cv2.resize(frame, (640, int(h0 * scale))) # Khóa chiều rộng, chiều dài co dãn theo
-    
-    # Cắt lấy vùng trung tâm 640x720 để đồng nhất hoàn toàn với Streamlit (app2.py)
-    h, w = frame.shape[:2]
-    if h > 720:
-        y_start = (h - 720) // 2
-        frame = frame[y_start:y_start+720, :]
-    else:
-        frame = cv2.resize(frame, (640, 720)) # Ép size nếu ảnh quá thấp
-        
+    # 1. ÉP KÍCH THƯỚC CHUẨN NHƯ APP2.PY ĐỂ ĐO CHU VI KHÔNG BỊ LỆCH
+    frame = cv2.resize(frame, (640, 720))
     result = frame.copy()
     h, w = frame.shape[:2]
 
-    # 2. VÙNG ROI CỐ ĐỊNH NHƯ BẢN GỐC
-    roi_x1, roi_x2 = int(w * 0.20), int(w * 0.80)
-    roi_y1, roi_y2 = int(h * 0.15), int(h * 0.85)
+    # 2. KHUNG ROI (VÙNG QUAN TÂM) CHÍNH XÁC NHƯ APP2.PY
+    roi_x1 = int(w * 0.20)
+    roi_x2 = int(w * 0.80)
+    roi_y1 = int(h * 0.15)
+    roi_y2 = int(h * 0.85)
+
     roi = frame[roi_y1:roi_y2, roi_x1:roi_x2]
+    
     cv2.rectangle(result, (roi_x1, roi_y1), (roi_x2, roi_y2), (255, 255, 255), 2)
 
-    # 3. LÀM MỜ VÀ LỌC MÀU CHUẨN HSV
-    blur = cv2.GaussianBlur(roi, (7, 7), 0) # Quan trọng: Khử nhiễu để đo chu vi chuẩn
-    hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
-    
-    # Bắt màu Vàng và Trắng
-    yellow = cv2.inRange(hsv, np.array([10, 35, 55]), np.array([48, 255, 255]))
-    white = cv2.inRange(hsv, np.array([0, 0, 145]), np.array([179, 95, 255]))
-    color_mask = yellow | white 
-    
-    # Loại bỏ nền xanh lá cây
-    green = cv2.inRange(hsv, np.array([45, 35, 35]), np.array([95, 255, 255]))
-    color_mask = cv2.bitwise_and(color_mask, cv2.bitwise_not(green))
+    # 3. CHỈ LỌC DUY NHẤT MÀU VÀNG CỦA CÚC (BỎ QUA NỀN TRẮNG IPAD)
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    lower_yellow = np.array([15, 60, 60])
+    upper_yellow = np.array([40, 255, 255])
+    mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
 
+    # 4. KHỬ NHIỄU BẰNG HÌNH THÁI HỌC (MORPHOLOGY) NHƯ APP2.PY
     kernel = np.ones((9, 9), np.uint8)
-    mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     mask = cv2.dilate(mask, kernel, iterations=2)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -382,31 +369,49 @@ def classify_flower_image(image_bytes: bytes) -> Dict[str, Any]:
     area = 0.0
     detected = False
 
+    # 5. TÌM VÙNG VÀNG LỚN NHẤT & ĐO CHU VI
     if contours:
         largest = max(contours, key=cv2.contourArea)
         area = float(cv2.contourArea(largest))
         
-        if area > 1000: # Lọc bỏ nhiễu vụn vặt
+        # Chỉ lấy nếu diện tích đủ lớn để tránh bắt nhầm đóm vàng nhỏ
+        if area > 1000:
             detected = True
-            perimeter = float(cv2.arcLength(largest, True))
             contour_shifted = largest + np.array([[[roi_x1, roi_y1]]])
+            
+            # Vẽ viền xanh lá bọc quanh bông hoa
             cv2.drawContours(result, [contour_shifted], -1, (0, 255, 0), 4)
+            perimeter = float(cv2.arcLength(largest, True))
 
-    # 4. CHẤM ĐIỂM DỰA TRÊN NGƯỠNG CHU VI CHUẨN
+    # 6. CHẤM ĐIỂM (CLASSIFICATION RULES TỪ APP2.PY)
     if detected and perimeter > 800:
-        flower_type, quality, price_vnd, color = "TYPE 1 - LARGE", "Loại 1", 500000, (0, 255, 0)
+        flower_type = "TYPE 1 - LARGE"
+        quality = "Loại 1"
+        price_vnd = 500000
+        color = (0, 255, 0)
     elif detected and perimeter > 700:
-        flower_type, quality, price_vnd, color = "TYPE 2 - MEDIUM", "Loại 2", 400000, (0, 255, 255)
+        flower_type = "TYPE 2 - MEDIUM"
+        quality = "Loại 2"
+        price_vnd = 400000
+        color = (0, 255, 255)
     elif detected and perimeter > 550:
-        flower_type, quality, price_vnd, color = "TYPE 3 - SMALL", "Loại 3", 300000, (0, 0, 255)
+        flower_type = "TYPE 3 - SMALL"
+        quality = "Loại 3"
+        price_vnd = 300000
+        color = (0, 0, 255)
     else:
-        detected, flower_type, quality, price_vnd, color = False, "UNDETECTED", "Không xác định", 0, (255, 255, 255)
+        detected = False
+        flower_type = "UNDETECTED"
+        quality = "Không xác định"
+        price_vnd = 0
+        color = (255, 255, 255)
 
-    # VẼ KẾT QUẢ LÊN ẢNH
+    # VẼ INFO LÊN ẢNH
     cv2.putText(result, flower_type, (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.95, color, 3)
     cv2.putText(result, f"{price_vnd:,} VND", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.85, color, 2)
     cv2.putText(result, f"Perimeter: {int(perimeter)}", (20, 132), cv2.FONT_HERSHEY_SIMPLEX, 0.62, color, 2)
 
+    # Đóng gói ảnh gửi về Frontend
     ok, buffer = cv2.imencode(".jpg", result, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
     annotated_image = "data:image/jpeg;base64," + base64.b64encode(buffer).decode("utf-8") if ok else ""
 
@@ -421,7 +426,6 @@ def classify_flower_image(image_bytes: bytes) -> Dict[str, Any]:
         "area": round(area, 2),
         "annotated_image": annotated_image,
     }
-
 @app.errorhandler(413)
 def file_too_large(_):
     return json_error("Ảnh quá lớn. Hãy giảm dung lượng ảnh hoặc tăng MAX_UPLOAD_MB.", 413)
