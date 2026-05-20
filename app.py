@@ -10,14 +10,16 @@ import re
 import threading
 from typing import Any, Dict, Tuple
 
-import cv2
-import numpy as np
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from pymongo import MongoClient, ASCENDING, DESCENDING
 from werkzeug.security import check_password_hash, generate_password_hash
 from web3 import Web3
+try:
+    from web3.exceptions import TimeExhausted
+except Exception:  # web3 version fallback
+    TimeExhausted = TimeoutError
 
 load_dotenv()
 
@@ -145,38 +147,86 @@ def make_mock_tx_hash(payload: Dict[str, Any]) -> str:
     return "0x" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def send_to_blockchain(farmer: str, combined_flower_type: str, weight: int) -> Tuple[str, str]:
+
+def send_to_blockchain(farmer: str, combined_flower_type: str, weight: int) -> Tuple[str, str, str, Any, str]:
+    """Send harvest data to Sepolia and wait shortly for the receipt.
+
+    Returns: tx_hash, chain_mode, tx_status, block_number, error_message
+    tx_status is one of: confirmed, pending, failed.
+    """
     payload = {"farmer": farmer, "flower_type": combined_flower_type, "weight": weight}
 
     if BLOCKCHAIN_MODE == "mock" or (BLOCKCHAIN_MODE == "auto" and not blockchain_is_configured()):
-        return make_mock_tx_hash(payload), "mock"
+        return make_mock_tx_hash(payload), "mock", "confirmed", None, ""
 
     if not blockchain_is_configured():
         raise RuntimeError("Blockchain chưa cấu hình đủ PRIVATE_KEY, CONTRACT_ADDRESS hoặc WEB3_RPC_URL.")
+
+    if w3 is None or not w3.is_connected():
+        raise RuntimeError("Không kết nối được Web3 RPC. Kiểm tra WEB3_RPC_URL.")
 
     contract_address = Web3.to_checksum_address(CONTRACT_ADDRESS)
     account = w3.eth.account.from_key(PRIVATE_KEY)
     contract = w3.eth.contract(address=contract_address, abi=contract_abi)
 
+    function_call = contract.functions.addHarvest(farmer, combined_flower_type, weight)
+
     with tx_lock:
         nonce = w3.eth.get_transaction_count(account.address, "pending")
-        tx = contract.functions.addHarvest(farmer, combined_flower_type, weight).build_transaction(
-            {
-                "chainId": 11155111,
-                "gas": 3000000,
-                "gasPrice": w3.eth.gas_price,
-                "nonce": nonce,
-            }
-        )
+
+        tx_params = {
+            "chainId": 11155111,
+            "from": account.address,
+            "nonce": nonce,
+            "value": 0,
+        }
+
+        try:
+            estimated_gas = function_call.estimate_gas({"from": account.address})
+            tx_params["gas"] = min(int(estimated_gas * 1.3), 3_000_000)
+        except Exception:
+            tx_params["gas"] = 300_000
+
+        # Sepolia hiện dùng EIP-1559. Dùng maxFee để tránh giao dịch bị treo do gasPrice quá thấp.
+        try:
+            latest_block = w3.eth.get_block("latest")
+            base_fee = latest_block.get("baseFeePerGas")
+            if base_fee:
+                priority_gwei = float(os.getenv("MAX_PRIORITY_FEE_GWEI", "2"))
+                priority_fee = w3.to_wei(priority_gwei, "gwei")
+                max_fee = int(base_fee * 2 + priority_fee)
+                tx_params["maxPriorityFeePerGas"] = int(priority_fee)
+                tx_params["maxFeePerGas"] = int(max_fee)
+            else:
+                tx_params["gasPrice"] = int(w3.eth.gas_price * 1.35)
+        except Exception:
+            tx_params["gasPrice"] = int(w3.eth.gas_price * 1.35)
+
+        tx = function_call.build_transaction(tx_params)
         signed_tx = w3.eth.account.sign_transaction(tx, private_key=PRIVATE_KEY)
         raw_tx = getattr(signed_tx, "raw_transaction", None) or getattr(signed_tx, "rawTransaction", None)
         if raw_tx is None:
             raise RuntimeError("Không lấy được raw transaction từ Web3 signed transaction.")
-        tx_hash = w3.eth.send_raw_transaction(raw_tx)
-        return w3.to_hex(tx_hash), "real"
 
+        tx_hash = w3.eth.send_raw_transaction(raw_tx)
+        tx_hash_hex = w3.to_hex(tx_hash)
+
+    timeout_seconds = int(os.getenv("TX_WAIT_TIMEOUT", "75"))
+    try:
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash_hex, timeout=timeout_seconds, poll_latency=3)
+        if int(receipt.get("status", 0)) == 1:
+            return tx_hash_hex, "real", "confirmed", receipt.get("blockNumber"), ""
+        return tx_hash_hex, "real", "failed", receipt.get("blockNumber"), "Transaction đã mined nhưng status = 0."
+    except TimeExhausted:
+        return tx_hash_hex, "real", "pending", None, f"Transaction đã gửi nhưng chưa được mined sau {timeout_seconds}s."
 
 def classify_flower_image(image_bytes: bytes) -> Dict[str, Any]:
+    try:
+        import cv2
+        import numpy as np
+    except Exception as exc:
+        raise RuntimeError("Thiếu thư viện AI trên backend. Cập nhật requirements.txt, deploy lại backend, rồi kiểm tra log Render. Cần có: opencv-python-headless và numpy. Chi tiết: " + str(exc))
+
     """Detect and classify a chrysanthemum bundle from an uploaded image.
 
     The first integrated version was too strict: it only accepted a narrow yellow
@@ -456,7 +506,9 @@ def login():
 
 
 @app.route("/api/harvest", methods=["POST"])
+
 def add_harvest():
+    inserted_id = None
     try:
         harvests, _ = require_db()
         data = get_json_body()
@@ -478,11 +530,10 @@ def add_harvest():
         if not all(required):
             return json_error("Vui lòng điền đầy đủ thông tin bắt buộc.", 400)
 
-        combined_flower_type = f"{ma_lo}|{flower_name}|{ten_vuon}|{quality}|{gia_ban}"
-        tx_hash_hex, chain_mode = send_to_blockchain(farmer, combined_flower_type, weight)
-
         now_iso = utc_iso_now()
         now_display = vn_time_display()
+
+        # Lưu cloud trước để không mất phiếu nếu Blockchain/RPC bị treo.
         doc = {
             "farmer": farmer,
             "ma_lo": ma_lo,
@@ -495,22 +546,77 @@ def add_harvest():
             "quality": quality,
             "ghi_chu": ghi_chu,
             "flower_type": f"{flower_name} - {quality}",
-            "tx_hash": tx_hash_hex,
-            "blockchain_mode": chain_mode,
+            "tx_hash": "",
+            "blockchain_mode": "real" if BLOCKCHAIN_MODE != "mock" else "mock",
+            "blockchain_status": "creating",
+            "block_number": None,
+            "blockchain_error": "",
             "date": now_display,
             "recorded_at": now_iso,
             "ai_type": ai_type,
             "ai_price": ai_price,
             "ai_perimeter": ai_perimeter,
         }
-        harvests.insert_one(doc)
+        insert_result = harvests.insert_one(doc)
+        inserted_id = insert_result.inserted_id
 
-        return json_ok({"message": f"TxHash: {tx_hash_hex}", "tx_hash": tx_hash_hex, "blockchain_mode": chain_mode})
+        combined_flower_type = f"{ma_lo}|{flower_name}|{ten_vuon}|{quality}|{gia_ban}"
+        try:
+            tx_hash_hex, chain_mode, tx_status, block_number, chain_error = send_to_blockchain(
+                farmer, combined_flower_type, weight
+            )
+        except Exception as chain_exc:
+            chain_error = str(chain_exc)
+            update_fields = {
+                "blockchain_mode": "real" if BLOCKCHAIN_MODE != "mock" else "mock",
+                "blockchain_status": "failed",
+                "blockchain_error": chain_error,
+            }
+            harvests.update_one({"_id": inserted_id}, {"$set": update_fields})
+            doc.update(update_fields)
+            doc["_id"] = str(inserted_id)
+            return jsonify({
+                "status": "error",
+                "cloud_saved": True,
+                "message": "Phiếu đã lưu vào MongoDB nhưng Blockchain lỗi: " + chain_error,
+                "record": doc,
+            }), 502
+
+        update_fields = {
+            "tx_hash": tx_hash_hex,
+            "blockchain_mode": chain_mode,
+            "blockchain_status": tx_status,
+            "block_number": block_number,
+            "blockchain_error": chain_error,
+        }
+        harvests.update_one({"_id": inserted_id}, {"$set": update_fields})
+        doc.update(update_fields)
+        doc["_id"] = str(inserted_id)
+
+        if tx_status == "failed":
+            return jsonify({
+                "status": "error",
+                "cloud_saved": True,
+                "message": "Phiếu đã lưu MongoDB nhưng transaction Blockchain thất bại.",
+                "tx_hash": tx_hash_hex,
+                "tx_status": tx_status,
+                "record": doc,
+            }), 502
+
+        return json_ok({
+            "message": f"TxHash: {tx_hash_hex}",
+            "tx_hash": tx_hash_hex,
+            "tx_status": tx_status,
+            "blockchain_status": tx_status,
+            "blockchain_mode": chain_mode,
+            "block_number": block_number,
+            "cloud_saved": True,
+            "record": doc,
+        })
     except ValueError as exc:
         return json_error(str(exc), 400)
     except Exception as exc:
         return json_error(str(exc), 500)
-
 
 @app.route("/api/history", methods=["GET"])
 def get_history():
@@ -546,27 +652,106 @@ def get_stats():
         return json_error(str(exc), 500)
 
 
-@app.route("/api/classify-flower", methods=["POST"])
-def classify_flower():
+
+@app.route("/api/tx-status/<tx_hash>", methods=["GET"])
+def get_tx_status(tx_hash):
     try:
-        image_bytes = b""
-        if "image" in request.files:
-            image_bytes = request.files["image"].read()
-        else:
-            data = get_json_body()
-            image_base64 = clean_str(data.get("image_base64"))
-            if "," in image_base64:
-                image_base64 = image_base64.split(",", 1)[1]
-            if image_base64:
-                image_bytes = base64.b64decode(image_base64)
+        tx_hash = clean_str(tx_hash)
+        if not tx_hash:
+            return json_error("Thiếu tx_hash.", 400)
 
-        if not image_bytes:
-            return json_error("Thiếu ảnh. Gửi multipart field 'image' hoặc JSON image_base64.", 400)
+        if tx_hash.startswith("0xmock"):
+            return json_ok({"tx_hash": tx_hash, "tx_status": "confirmed", "blockchain_mode": "mock"})
 
-        result = classify_flower_image(image_bytes)
-        return json_ok(result)
+        if w3 is None or not w3.is_connected():
+            return json_error("Không kết nối được Web3 RPC.", 503)
+
+        try:
+            receipt = w3.eth.get_transaction_receipt(tx_hash)
+        except Exception:
+            return json_ok({"tx_hash": tx_hash, "tx_status": "pending", "blockchain_mode": "real"})
+
+        if receipt is None:
+            return json_ok({"tx_hash": tx_hash, "tx_status": "pending", "blockchain_mode": "real"})
+
+        tx_status = "confirmed" if int(receipt.get("status", 0)) == 1 else "failed"
+        block_number = receipt.get("blockNumber")
+
+        if harvest_collection is not None:
+            harvest_collection.update_one(
+                {"tx_hash": tx_hash},
+                {"$set": {"blockchain_status": tx_status, "block_number": block_number}},
+            )
+
+        return json_ok({
+            "tx_hash": tx_hash,
+            "tx_status": tx_status,
+            "blockchain_status": tx_status,
+            "block_number": block_number,
+            "blockchain_mode": "real",
+        })
     except Exception as exc:
         return json_error(str(exc), 500)
+
+
+
+def extract_image_bytes_from_request() -> tuple[bytes, str]:
+    """Accept image from multipart, JSON base64, raw image body, or any uploaded file field.
+
+    This avoids the common demo bug where frontend sends the image but backend only
+    looks for one exact field name.
+    """
+    if request.files:
+        file_storage = request.files.get("image")
+        if file_storage is None:
+            file_storage = next(iter(request.files.values()))
+        image_bytes = file_storage.read()
+        return image_bytes or b"", f"multipart:{file_storage.name or 'unknown'}"
+
+    content_type = (request.content_type or "").lower()
+    if "application/json" in content_type:
+        data = get_json_body()
+        image_base64 = ""
+        for key in ("image_base64", "image", "imageData", "dataUrl", "data_url"):
+            image_base64 = clean_str(data.get(key))
+            if image_base64:
+                break
+        if image_base64:
+            if "," in image_base64:
+                image_base64 = image_base64.split(",", 1)[1]
+            image_base64 = image_base64.strip()
+            try:
+                return base64.b64decode(image_base64, validate=False), "json-base64"
+            except Exception as exc:
+                raise ValueError("Chuỗi base64 ảnh không hợp lệ: " + str(exc))
+
+    raw = request.get_data() or b""
+    if raw and ("image/" in content_type or raw[:2] == b"\xff\xd8" or raw[:8] == b"\x89PNG\r\n\x1a\n"):
+        return raw, "raw-body"
+
+    return b"", "none"
+
+
+@app.route("/api/classify-flower", methods=["POST", "OPTIONS"])
+def classify_flower():
+    if request.method == "OPTIONS":
+        return json_ok({"message": "preflight ok"})
+
+    try:
+        image_bytes, source = extract_image_bytes_from_request()
+        if not image_bytes:
+            return json_error(
+                "Backend không nhận được ảnh. Frontend phải gửi multipart field 'image' hoặc JSON image_base64.",
+                400,
+            )
+
+        result = classify_flower_image(image_bytes)
+        result["input_source"] = source
+        result["input_size_bytes"] = len(image_bytes)
+        return json_ok(result)
+    except Exception as exc:
+        # Return a clear diagnostic instead of the vague "backend cannot analyze".
+        return json_error("AI backend không phân tích được hình ảnh: " + str(exc), 500)
 
 
 @app.route("/api/weather", methods=["GET"])
